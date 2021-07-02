@@ -6,6 +6,102 @@ import (
 	"time"
 )
 
+/**
+ * 引用：https://blog.csdn.net/lixiaowei16/article/details/90485157
+ * 		http://vearne.cc/archives/39317
+ * 		https://github.com/shaoyuan1943/gokcp/blob/master/kcp.go
+ *		https://github.com/xtaci/kcp-go
+ *
+ * 0               4   5   6       8 (BYTE)
+ * +---------------+---+---+-------+
+ * |     conv      |cmd|frg|  wnd  |
+ * +---------------+---+---+-------+   8
+ * |     ts        |     sn        |
+ * +---------------+---------------+  16
+ * |     una       |     len       |
+ * +---------------+---------------+  24
+ * |                               |
+ * |        DATA (optional)        |
+ * |                               |
+ * +-------------------------------+
+ * conv:连接号。UDP是无连接的，conv用于表示来自于哪个客户端。对连接的一种替代, 因为有conv, 所以KCP也是支持多路复用的
+ * cmd:命令类型，只有四种:
+ * 				CMD四种类型
+ *                     ----------------------------------------------------------------------------------
+ * 					   |cmd 			|作用 					|备注                    				|
+ *                     ----------------------------------------------------------------------------------
+ * 					   |IKCP_CMD_PUSH 	|数据推送命令            |与IKCP_CMD_ACK对应      				|
+ *                     ----------------------------------------------------------------------------------
+ * 					   |IKCP_CMD_ACK 	|确认命令                |1、RTO更新，2、确认发送包接收方已接收到	|
+ *                     ----------------------------------------------------------------------------------
+ * 					   |IKCP_CMD_WASK 	|接收窗口大小询问命令     |与IKCP_CMD_WINS对应      				|
+ *                     ----------------------------------------------------------------------------------
+ * 					   |IKCP_CMD_WINS 	|接收窗口大小告知命令     |                        				|
+ *                     ----------------------------------------------------------------------------------
+ * frg:分片，用户数据可能会被分成多个KCP包，发送出去
+ * wnd:接收窗口大小，发送方的发送窗口不能超过接收方给出的数值
+ * ts: 时间序列
+ * sn: 序列号
+ * una:下一个可接收的序列号。其实就是确认号，收到sn=10的包，una为11
+ * len:数据长度(DATA的长度)
+ * data:用户数据
+ *
+ * KCP流程说明
+ * 1. 判定是消息模式还是流模式
+ * 		1.1 消息模式(不拆包): 对应传输--文本消息
+ * 			KCP header        KCP DATA
+ *       -----------------------------------------------------------------------------------------------------------------------
+ *       |  sn  |  90  |  --------------------  |  sn  |  91  |  --------------------  |  sn  |  92  |  --------------------   |
+ *       |  frg |  0   |  |       MSG1       |  |  frg |  0   |  |       MSG2       |  |  frg |  0   |  |       MSG3       |   |
+ *       |  len |  15  |  --------------------  |  sn  |  20  |  --------------------  |  sn  |  18  |  --------------------   |
+ *       -----------------------------------------------------------------------------------------------------------------------
+ * 		1.2 消息模式(拆包；拆包原则：根据MTU(最大传输单元决定))：对应传输--图片或文件消息
+ * 			KCP header        KCP DATA
+ *       -----------------------------------------------------------------------------------------------------------------------
+ *       |  sn  |  90  |  --------------------  |  sn  |  91  |  --------------------  |  sn  |  92  |  --------------------   |
+ *       |  frg |  2   |  |      MSG4-1      |  |  frg |  1   |  |      MSG4-2      |  |  frg |  0   |  |      MSG4-3      |   |
+ *       |  len | 1376 |  --------------------  |  sn  | 1376 |  --------------------  |  sn  |  500 |  --------------------   |
+ *       -----------------------------------------------------------------------------------------------------------------------
+ * 		Msg被拆成了3部分，包含在3个KCP包中。注意, frg的序号是从大到小的，一直到0为止。这样接收端收到KCP包时，只有拿到frg为0的包，才会进行组装并交付给上层应用程序。
+ *         由于frg在header中占1个字节，也就是最大能支持（1400 – 24[所有头的长度]） * 256 / 1024 = 344kB的消息
+ * 		1.3 流模式
+ * 			KCP header        KCP DATA
+ *       ---------------------------------------------------------------------------------
+ *       |  sn  |  90  |  -------  ------  --------  |  sn  |  91  |  --------------------
+ *       |  frg |  0   |  | MSG1| | MSG2| | MSG3-1|  |  frg |  0   |  |       MSG3-2     |
+ *       |  len | 1376 |  ------  ------  ---------  |  sn  |  53  |  --------------------
+ *       ---------------------------------------------------------------------------------
+ *      1.4 消息模式与流模式对比
+ * 			1.4.1 消息模式：	减少了上层应用拆分数据流的麻烦，但是对网络的利用率较低。Payload(有效载荷)少，KCP头占比过大。
+ * 			1.4.2 流模式：	KCP试图让每个KCP包尽可能装满。一个KCP包中可能包含多个消息。但是上层应用需要自己来判断每个消息的边界。
+ * 2. 根据不同模式，得到需要传输的数据片段(segment)
+ * 3. 数据片段在发送端会存储在snd_queue中
+ * -----------------进入发送、传输、接收阶段------------------------------------------------------------------
+ * 		-------------------------									-------------------------
+ * 		|	Sender				|									|	Receiver			|
+ * 		|		 ------------	|									|		 ------------	|
+ *		|		|	APP		|	|									|		|	APP		|	|
+ *		|		------------	|									|		------------	|
+ *		|		    \|/		|										|		    /|\			|
+ * 		|		------------	|									|		------------	|
+ *		|		|  send buf	|---|--------------- LINK --------------|----->	|receive buf|	|
+ *		|		------------	|									|		------------	|
+ * 		-------------------------									-------------------------
+ * 		此过程中的三个阶段分别对应一个容量(发送阶段：IKCP_WND_SND，传输阶段：cwnd，接受阶段：IKCP_WND_RCV)
+ * 		cwnd剩余容量：snd_nxt(计划要发送的下一个segment号)-snd_una(接受端已经确认的最大连续接受号)=LINK中途在传输的数据量
+ * 4. 需要发送的时候，会将数据转移到snd_buf；但是snd_buf大小是有限的，所以在转移之前需要判定snd_buf的大小
+ *		4.1 snd_buf未满：将snd_queue的数据块flush到snd_buf，知道snd_queue清空或snd_buf已满停止
+ * 		4.2 snd_buf已满、cwnd未满: 将snd_buf的数据send出去，然后将snd_queue写入snd_buf
+ * 		4.3 snd_buf已满、cwnd已满: 不在写入，通过一个定时器定时判断cwnd是否有剩余流量，如果存在，完成第二步操作
+ * 		4.4 其他情况：
+ * 			4.4.1 如果snd_queue已满，snd_buf已满，cwnd已满，数据依然会直接flush，如果失败，即算超时处理
+ *			4.4.2 如果NoDelay=false，就不在写入snd_buf
+ * 5. LINK: 回调UDP的send进行传输(kcp->output=udp_output)
+ * 6. 接受数据:
+ * 		6.1 数据发送给接受端，接受端通过input进行接受，并解包receive buf，有确认的数据包recv_buf-->recv_queue
+ *		6.2 获取完整用户数据：从receive queue中进行拼装完整用户数据
+ */
+
 const (
 	IKCP_RTO_NDL     = 30  // no delay min rto
 	IKCP_RTO_MIN     = 100 // normal min rto
@@ -15,17 +111,17 @@ const (
 	IKCP_CMD_ACK     = 82 // cmd: ack
 	IKCP_CMD_WASK    = 83 // cmd: window probe (ask)
 	IKCP_CMD_WINS    = 84 // cmd: window size (tell)
-	IKCP_ASK_SEND    = 1  // need to send IKCP_CMD_WASK
-	IKCP_ASK_TELL    = 2  // need to send IKCP_CMD_WINS
-	IKCP_WND_SND     = 32
+	IKCP_ASK_SEND    = 1  // need to send IKCP_CMD_WASK	表示请求远端告知窗口大小
+	IKCP_ASK_TELL    = 2  // need to send IKCP_CMD_WINS 表示告知远端窗口大小
+	IKCP_WND_SND     = 32 // send win size			发送窗口大小
 	IKCP_WND_RCV     = 32
-	IKCP_MTU_DEF     = 1400
+	IKCP_MTU_DEF     = 1400 // 最大传输单元 MSS(最大片段尺寸)=MTU-OVERHEAD
 	IKCP_ACK_FAST    = 3
-	IKCP_INTERVAL    = 100
-	IKCP_OVERHEAD    = 24
-	IKCP_DEADLINK    = 20
-	IKCP_THRESH_INIT = 2
-	IKCP_THRESH_MIN  = 2
+	IKCP_INTERVAL    = 100    // 最小重传时间(单位ms)
+	IKCP_OVERHEAD    = 24     // 头信息大小
+	IKCP_DEADLINK    = 20     // 最大重传次数
+	IKCP_THRESH_INIT = 2      //	塞窗口初始值
+	IKCP_THRESH_MIN  = 2      //  拥塞窗口最小值
 	IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
 	IKCP_PROBE_LIMIT = 120000 // up to 120 secs to probe window
 	IKCP_SN_OFFSET   = 12
@@ -131,30 +227,28 @@ func (seg *segment) encode(ptr []byte) []byte {
 
 // KCP defines a single KCP connection
 type KCP struct {
-	conv, mtu, mss, state                  uint32
-	snd_una, snd_nxt, rcv_nxt              uint32
-	ssthresh                               uint32
-	rx_rttvar, rx_srtt                     int32
-	rx_rto, rx_minrto                      uint32
-	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe uint32
-	interval, ts_flush                     uint32
-	nodelay, updated                       uint32
-	ts_probe, probe_wait                   uint32
-	dead_link, incr                        uint32
+	conv, mtu, mss, state                  uint32 // conv:客户端来源id； mtu：最大传输单元(默认1400)；mss: 最大片段尺寸MTU-OVERHEAD；state: 连接状态（0xFFFFFFFF表示断开连接）
+	snd_una, snd_nxt, rcv_nxt              uint32 // snd_una: 第一个未确认的包; snd_nxt：下一个要发送的sn; rcv_nxt：下一个应该接受的sn
+	ssthresh                               uint32 // 拥塞窗口阈值
+	rx_rttvar, rx_srtt                     int32  // RTT的平均偏差; RTT的一个加权RTT平均值，平滑值; RTT: 一个报文段发送出去，到收到对应确认包的时间差。
+	rx_rto, rx_minrto                      uint32 // 由ack接收延迟计算出来的重传超时时间(重传超时时间)，最小重传超时时间
+	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe uint32 // 发送窗口；接收窗口；远程窗口(发送端获取的接受端尺寸)；拥塞窗口大小(传输窗口)；探查变量
+	interval, ts_flush                     uint32 // 内部flush刷新间隔;  下次flush刷新时间戳
+	nodelay, updated                       uint32 // 是否启动无延迟模式：0不需要，1需要；updated: 是否调用过update函数的标识
+	ts_probe, probe_wait                   uint32 // 窗口探查时间，窗口探查时间间隔
+	dead_link, incr                        uint32 // 最大重传次数; 可发送的最大数据量
 
-	fastresend     int32
-	nocwnd, stream int32
+	fastresend     int32 // 重传
+	nocwnd, stream int32 // 取消拥塞控制，是否是流模式
 
-	snd_queue []segment
-	rcv_queue []segment
-	snd_buf   []segment
-	rcv_buf   []segment
+	snd_queue, snd_buf []segment // 发送队列; 发送buf
+	rcv_queue, rcv_buf []segment // 接收队列; 接收buf
 
-	acklist []ackItem
+	acklist []ackItem // 待发送的ack列表(包含sn与ts)  |sn0|ts0|sn1|ts1|... 形式存在
 
-	buffer   []byte
-	reserved int
-	output   output_callback
+	buffer   []byte          // 存储消息字节流的内存
+	reserved int             // 不同协议保留位数
+	output   output_callback // 回调函数
 }
 
 type ackItem struct {
@@ -238,6 +332,12 @@ func (kcp *KCP) PeekSize() (length int) {
 	return
 }
 
+// Recv
+/**
+ * 6.2 获取完整用户数据：从receive queue中进行拼装完整用户数据
+ * 1. 遍历rcv_queue中，是否可以获取到连续块却最后一块的frg=0的情况，如果存在，则提取一个完整用户数据；并删除rcv_queue中对应的数据块，释放空间
+ * 2. 提取完成后，遍历rcv_buf中，是否还有有效数据，更新到rcv_queue中；等待下次进行判断
+ */
 // Receive data from kcp state machine
 //
 // Return number of bytes read.
@@ -262,7 +362,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 
 	// merge fragment
 	count := 0
-	for k := range kcp.rcv_queue {
+	for k := range kcp.rcv_queue { // 如果frg=0,则表示是一个分拆的数据中的最后一个数据块
 		seg := &kcp.rcv_queue[k]
 		copy(buffer, seg.data)
 		buffer = buffer[len(seg.data):]
@@ -276,7 +376,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	if count > 0 {
 		kcp.rcv_queue = kcp.remove_front(kcp.rcv_queue, count)
 	}
-
+	// 释放了部分rcv_queue空间后，判断rcv_buf中，是否还有有效数据需要更新到rcv_queue中
 	// move available data from rcv_buf -> rcv_queue
 	count = 0
 	for k := range kcp.rcv_buf {
@@ -304,6 +404,9 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 }
 
 // Send is user/upper level send, returns below zero for error
+// * Send 数据格式化--> Segment
+// * 1. 先判断消息类型；如果是流模式，则判断是否与现有Segment合并
+// * 2. 如果是消息模式，则创建新Segment
 func (kcp *KCP) Send(buffer []byte) int {
 	var count int
 	if len(buffer) == 0 {
@@ -526,6 +629,12 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 // codecs.
 //
 // 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
+/**
+ * 6.1 数据发送给接受端，接受端通过input进行接受，并解包receive buf，有确认的数据包recv_buf-->recv_queue
+ * 1. 解包
+ * 2. 确认是否有新的确认块，确认块需要重recv_buf-->recv_queue
+ * 3. 更新相关参数，主要是是否有确认过未删除，recv_buf，recv_queue的尺寸
+ */
 func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	snd_una := kcp.snd_una
 	if len(data) < IKCP_OVERHEAD {
@@ -594,8 +703,8 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 					seg.ts = ts
 					seg.sn = sn
 					seg.una = una
-					seg.data = data[:length] // delayed data copying
-					repeat = kcp.parse_data(seg)
+					seg.data = data[:length]     // delayed data copying
+					repeat = kcp.parse_data(seg) //// 输入放入recv_buf,并确认是否有确认数据块放入到recv_queue
 				}
 			}
 			if regular && repeat {
@@ -670,6 +779,12 @@ func (kcp *KCP) wnd_unused() uint16 {
 }
 
 // flush pending data
+/**
+ * 4. 需要发送的时候，会将数据转移到snd_buf；但是snd_buf大小是有限的，所以在转移之前需要判定snd_buf的大小
+ * ackOnly=true  更新acklist(待发送列表)
+ * ackOnly=false 更新acklist(待发送列表), 将snd_queue移动到snd_buf，确认重传数据及时间
+ * 通过kcp.output:发送数据
+ */
 func (kcp *KCP) flush(ackOnly bool) uint32 {
 	var seg segment
 	seg.conv = kcp.conv
@@ -677,8 +792,8 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	seg.wnd = kcp.wnd_unused()
 	seg.una = kcp.rcv_nxt
 
-	buffer := kcp.buffer
-	ptr := buffer[kcp.reserved:] // keep n bytes untouched
+	buffer := kcp.buffer         // 默认情况buffer=mtu的大小
+	ptr := buffer[kcp.reserved:] // keep n bytes untouched 默认情况ptr等于mtu-kcp.reserved
 
 	// makeSpace makes room for writing
 	makeSpace := func(space int) {
@@ -689,11 +804,12 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		}
 	}
 
+	// 调用底层通讯协议，发送数据，比例UDP协议
 	// flush bytes in buffer if there is any
 	flushBuffer := func() {
-		size := len(buffer) - len(ptr)
-		if size > kcp.reserved {
-			kcp.output(buffer, size)
+		size := len(buffer) - len(ptr) // 如果没有数据扩充，size=kcp.reserved
+		if size > kcp.reserved {       // 判断buffer是否扩充
+			kcp.output(buffer, size) // 调用回调函数进行发送，数据会发送到接收端--对于数据源是来自buffer，而不是snd_buf，不理解
 		}
 	}
 
@@ -708,44 +824,45 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	}
 	kcp.acklist = kcp.acklist[0:0]
 
+	// 仅仅更新acklist
 	if ackOnly { // flash remain ack segments
 		flushBuffer()
 		return kcp.interval
 	}
 
 	// probe window size (if remote window size equals zero)
-	if kcp.rmt_wnd == 0 {
+	if kcp.rmt_wnd == 0 { // 如果远程端口尺寸==0
 		current := currentMs()
-		if kcp.probe_wait == 0 {
-			kcp.probe_wait = IKCP_PROBE_INIT
-			kcp.ts_probe = current + kcp.probe_wait
+		if kcp.probe_wait == 0 { // 如果探查等待时间也没有设定
+			kcp.probe_wait = IKCP_PROBE_INIT        // 则7s后进行窗口尺寸探查
+			kcp.ts_probe = current + kcp.probe_wait // 探查时间为当前时间+7s
 		} else {
-			if _itimediff(current, kcp.ts_probe) >= 0 {
+			if _itimediff(current, kcp.ts_probe) >= 0 { // 判断当前时间已经到达窗口探查时间
 				if kcp.probe_wait < IKCP_PROBE_INIT {
 					kcp.probe_wait = IKCP_PROBE_INIT
 				}
-				kcp.probe_wait += kcp.probe_wait / 2
-				if kcp.probe_wait > IKCP_PROBE_LIMIT {
+				kcp.probe_wait += kcp.probe_wait / 2   // 探查时间扩充一半
+				if kcp.probe_wait > IKCP_PROBE_LIMIT { // 如果新的扩充时间大于120s
 					kcp.probe_wait = IKCP_PROBE_LIMIT
 				}
-				kcp.ts_probe = current + kcp.probe_wait
-				kcp.probe |= IKCP_ASK_SEND
+				kcp.ts_probe = current + kcp.probe_wait // 更新下一次探查时间
+				kcp.probe |= IKCP_ASK_SEND              // 设置此次为需要探查
 			}
 		}
 	} else {
-		kcp.ts_probe = 0
+		kcp.ts_probe = 0 // 如果知道远程端口尺寸，则无需设定探查时间与下次探查时间
 		kcp.probe_wait = 0
 	}
 
 	// flush window probing commands
-	if (kcp.probe & IKCP_ASK_SEND) != 0 {
+	if (kcp.probe & IKCP_ASK_SEND) != 0 { // 如果需要探查，设定命令字
 		seg.cmd = IKCP_CMD_WASK
 		makeSpace(IKCP_OVERHEAD)
 		ptr = seg.encode(ptr)
 	}
 
 	// flush window probing commands
-	if (kcp.probe & IKCP_ASK_TELL) != 0 {
+	if (kcp.probe & IKCP_ASK_TELL) != 0 { // 如果是接受端回复
 		seg.cmd = IKCP_CMD_WINS
 		makeSpace(IKCP_OVERHEAD)
 		ptr = seg.encode(ptr)
@@ -754,68 +871,73 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	kcp.probe = 0
 
 	// calculate window size
-	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)
-	if kcp.nocwnd == 0 {
-		cwnd = _imin_(kcp.cwnd, cwnd)
+	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd) // 传输窗口是发送端与接收端中较小的一个
+	if kcp.nocwnd == 0 {                     // 如果未取消拥塞控制
+		cwnd = _imin_(kcp.cwnd, cwnd) // 正在发送的数据大小与窗口尺寸比较
 	}
 
 	// sliding window, controlled by snd_nxt && sna_una+cwnd
 	newSegsCount := 0
 	for k := range kcp.snd_queue {
+		// kcp.snd_nxt[待发送的sn]-(kcp.snd_una[已经确认的连续sn号]+cwnd[发送途中的数量])>=0
+		// 表示发送中+未确认的已经大于cwnd的尺寸了，需要等待
 		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
 			break
 		}
-		newseg := kcp.snd_queue[k]
-		newseg.conv = kcp.conv
-		newseg.cmd = IKCP_CMD_PUSH
-		newseg.sn = kcp.snd_nxt
-		kcp.snd_buf = append(kcp.snd_buf, newseg)
+		newseg := kcp.snd_queue[k]                // 从开始位置取数据
+		newseg.conv = kcp.conv                    // 客户端号，一个客户端的号码在同一次启动中是唯一的
+		newseg.cmd = IKCP_CMD_PUSH                // 数据推出命令字
+		newseg.sn = kcp.snd_nxt                   // 设定
+		kcp.snd_buf = append(kcp.snd_buf, newseg) // 将数据移动到snd_buf中去
 		kcp.snd_nxt++
 		newSegsCount++
 	}
-	if newSegsCount > 0 {
+	if newSegsCount > 0 { // 如果有将snd_queue中的数据移动至snd_buf中，则需要将snd_queue中的对应数据删除
 		kcp.snd_queue = kcp.remove_front(kcp.snd_queue, newSegsCount)
 	}
 
+	////////////////// 设置重传策略 ///////////////////////////////
 	// calculate resent
 	resent := uint32(kcp.fastresend)
-	if kcp.fastresend <= 0 {
+	if kcp.fastresend <= 0 { // 如果触发快速重传的重复ack个数 <= 0
 		resent = 0xffffffff
 	}
 
 	// check for retransmissions
 	current := currentMs()
+	// 新变更传输状态的数量，丢失片段数，快速重发片段数，提前重发片段数
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	minrto := int32(kcp.interval)
 
+	// 确定核查边界
 	ref := kcp.snd_buf[:len(kcp.snd_buf)] // for bounds check elimination
-	for k := range ref {
+	for k := range ref {                  // 将确定要检查的内容进行遍历
 		segment := &ref[k]
 		needsend := false
-		if segment.acked == 1 {
+		if segment.acked == 1 { // 如果此记录以及被确认过
 			continue
 		}
-		if segment.xmit == 0 { // initial transmit
+		if segment.xmit == 0 { // initial transmit 如果传输状态为0--> 未发送
 			needsend = true
-			segment.rto = kcp.rx_rto
-			segment.resendts = current + segment.rto
-		} else if segment.fastack >= resent { // fast retransmit
+			segment.rto = kcp.rx_rto                 // 重传超时时间
+			segment.resendts = current + segment.rto // 发送时间
+		} else if segment.fastack >= resent { // fast retransmit 快速确认act数>快速重传数
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
 			segment.resendts = current + segment.rto
 			change++
 			fastRetransSegs++
-		} else if segment.fastack > 0 && newSegsCount == 0 { // early retransmit
+		} else if segment.fastack > 0 && newSegsCount == 0 { // early retransmit 快速确认数>0且没有新数据加入
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
 			segment.resendts = current + segment.rto
 			change++
 			earlyRetransSegs++
-		} else if _itimediff(current, segment.resendts) >= 0 { // RTO
+		} else if _itimediff(current, segment.resendts) >= 0 { // RTO  当前时间已经达到重传时间的
 			needsend = true
-			if kcp.nodelay == 0 {
+			if kcp.nodelay == 0 { // 如果不启动无延迟模式(延迟)；当前Segment的每一次重传时间加rx_rto
 				segment.rto += kcp.rx_rto
 			} else {
 				segment.rto += kcp.rx_rto / 2
@@ -827,7 +949,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 
 		if needsend {
 			current = currentMs()
-			segment.xmit++
+			segment.xmit++ // segment重传次数
 			segment.ts = current
 			segment.wnd = seg.wnd
 			segment.una = seg.una
@@ -838,13 +960,13 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 			copy(ptr, segment.data)
 			ptr = ptr[len(segment.data):]
 
-			if segment.xmit >= kcp.dead_link {
-				kcp.state = 0xFFFFFFFF
+			if segment.xmit >= kcp.dead_link { // 最大重传次数
+				kcp.state = 0xFFFFFFFF // 连接状态（0xFFFFFFFF表示断开连接）
 			}
 		}
 
 		// get the nearest rto
-		if rto := _itimediff(segment.resendts, current); rto > 0 && rto < minrto {
+		if rto := _itimediff(segment.resendts, current); rto > 0 && rto < minrto { // 如果重传时间已到，并且重传时间小于最小重传时间
 			minrto = rto
 		}
 	}
@@ -852,6 +974,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	// flash remain segments
 	flushBuffer()
 
+	// 计数
 	// counter updates
 	sum := lostSegs
 	if lostSegs > 0 {
@@ -870,17 +993,17 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	}
 
 	// cwnd update
-	if kcp.nocwnd == 0 {
+	if kcp.nocwnd == 0 { // 如果未取消拥塞控制
 		// update ssthresh
 		// rate halving, https://tools.ietf.org/html/rfc6937
 		if change > 0 {
-			inflight := kcp.snd_nxt - kcp.snd_una
+			inflight := kcp.snd_nxt - kcp.snd_una // 待发送的与未确认最小值得差值==未确认的总数
 			kcp.ssthresh = inflight / 2
-			if kcp.ssthresh < IKCP_THRESH_MIN {
+			if kcp.ssthresh < IKCP_THRESH_MIN { // 如果 拥塞窗口阈值 小于 拥塞窗口最小值
 				kcp.ssthresh = IKCP_THRESH_MIN
 			}
-			kcp.cwnd = kcp.ssthresh + resent
-			kcp.incr = kcp.cwnd * kcp.mss
+			kcp.cwnd = kcp.ssthresh + resent // 拥塞窗口阈值+重传数量
+			kcp.incr = kcp.cwnd * kcp.mss    // 可发送的最大数据量=拥塞窗口*最大分片大小
 		}
 
 		// congestion control, https://tools.ietf.org/html/rfc5681
