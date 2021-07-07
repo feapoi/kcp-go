@@ -107,10 +107,10 @@ const (
 	IKCP_RTO_MIN     = 100 // normal min rto
 	IKCP_RTO_DEF     = 200
 	IKCP_RTO_MAX     = 60000
-	IKCP_CMD_PUSH    = 81 // cmd: push data
-	IKCP_CMD_ACK     = 82 // cmd: ack
-	IKCP_CMD_WASK    = 83 // cmd: window probe (ask)
-	IKCP_CMD_WINS    = 84 // cmd: window size (tell)
+	IKCP_CMD_PUSH    = 81 // cmd: push data 数据推送命令
+	IKCP_CMD_ACK     = 82 // cmd: ack		确认命令
+	IKCP_CMD_WASK    = 83 // cmd: window probe (ask)	接收窗口大小询问命令
+	IKCP_CMD_WINS    = 84 // cmd: window size (tell)	接收窗口大小告知命令
 	IKCP_ASK_SEND    = 1  // need to send IKCP_CMD_WASK	表示请求远端告知窗口大小
 	IKCP_ASK_TELL    = 2  // need to send IKCP_CMD_WINS 表示告知远端窗口大小
 	IKCP_WND_SND     = 32 // send win size			发送窗口大小
@@ -199,14 +199,14 @@ type segment struct {
 	conv     uint32
 	cmd      uint8
 	frg      uint8
-	wnd      uint16
-	ts       uint32
-	sn       uint32
-	una      uint32
-	rto      uint32
-	xmit     uint32
-	resendts uint32
-	fastack  uint32
+	wnd      uint16 //接收窗口大小
+	ts       uint32 //时间序列
+	sn       uint32 //序列号
+	una      uint32 //下一个可接收的序列号，其实就是确认号
+	rto      uint32 //由ack接收延迟计算出来的重传超时时间
+	xmit     uint32 //发送分片的次数，每发送一次加一
+	resendts uint32 //下次超时重传的时间戳
+	fastack  uint32 //收到ack时计算的该分片被跳过的累计次数
 	acked    uint32 // mark if the seg has acked
 	data     []byte
 }
