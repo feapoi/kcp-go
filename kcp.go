@@ -909,7 +909,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		}
 
 		data = ikcp_decode32u(data, &conv)
-		if conv != kcp.conv {
+		if conv != kcp.conv { // 判断连续号，确认数据是否应该是目标来源的
 			return -1
 		}
 
@@ -920,12 +920,12 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		data = ikcp_decode32u(data, &sn)
 		data = ikcp_decode32u(data, &una)
 		data = ikcp_decode32u(data, &length)
-		if len(data) < int(length) {
+		if len(data) < int(length) { // 剩余data长度是否小于元数据中指定的数据长度
 			return -2
 		}
 
 		if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
-			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
+			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS { // 数据命令字错误
 			return -3
 		}
 
@@ -933,20 +933,20 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		if regular {
 			kcp.rmt_wnd = uint32(wnd)
 		}
-		if kcp.parse_una(una) > 0 {
+		if kcp.parse_una(una) > 0 { // 如果有新的确认数据
 			windowSlides = true
 		}
 		kcp.shrink_buf()
 
-		if cmd == IKCP_CMD_ACK {
-			kcp.parse_ack(sn)
-			kcp.parse_fastack(sn, ts)
+		if cmd == IKCP_CMD_ACK { // 窗口应答数据
+			kcp.parse_ack(sn)         // 确认snd_buf中的数据是否存在已经确认，但是未删除的seg，删除掉，空出空间
+			kcp.parse_fastack(sn, ts) // 更新快速确认数，判断snd_buf中，是否存在，sn小，ts也比较早的数据，进行快速确认，以便空出空间
 			flag |= 1
 			latest = ts
-		} else if cmd == IKCP_CMD_PUSH {
+		} else if cmd == IKCP_CMD_PUSH { // 用户数据
 			repeat := true
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
-				kcp.ack_push(sn, ts)
+				kcp.ack_push(sn, ts) // 更新acklist表
 				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
 					var seg segment
 					seg.conv = conv
@@ -987,6 +987,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		}
 	}
 
+	// 当收到数据包的时候，根据上面是否有新的确认包，更新当前窗口的剩余大小
 	// cwnd update when packet arrived
 	if kcp.nocwnd == 0 {
 		if _itimediff(kcp.snd_una, snd_una) > 0 {
